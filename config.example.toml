@@ -1,0 +1,13 @@
+# 示例配置文件（优先级低于环境变量 APP_* 与代码 override，高于内置默认）
+app_name = "scaffold-demo"
+debug = false
+log_level = "INFO"
+
+# 启用的插件，顺序为根顺序；依赖会自动提前装配；["*"] 表示全部已注册插件
+plugins = ["counter", "echo", "session"]
+
+[plugin_config.counter]
+start = 100
+
+[plugin_config.session]
+prefix = "sess"
