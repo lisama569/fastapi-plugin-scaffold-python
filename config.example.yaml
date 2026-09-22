@@ -1,0 +1,13 @@
+# 示例配置文件（优先级低于环境变量与显式覆盖）
+app_name: fastapi-plugin-scaffold
+log_level: info
+plugins:
+  clock:
+    enabled: true
+    scope: app
+    options: {}
+  greeter:
+    enabled: true
+    scope: request
+    options:
+      greeting: hello
