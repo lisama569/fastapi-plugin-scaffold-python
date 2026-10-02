@@ -59,3 +59,21 @@ from app.ext.fastapi_lifespan import requires
 async def index(svc: MyService = Depends(requires("my-service"))):
     ...
 ```
+
+## 运行期热更新
+
+改配置不用重启进程：`POST /reload` 会按相同来源与优先级重新加载配置、
+增量装配并原子切换——新请求立即用新装配，在途请求用旧装配跑完，
+配置未变的应用级插件复用旧实例（不重复初始化/连接外部资源）。
+
+```bash
+# 修改 config.example.yaml（如 greeter 的 greeting、某插件 enabled）后：
+curl -s -X POST http://127.0.0.1:8000/reload
+# 成功: {"ok": true, "reused": ["clock"], "rebuilt": [...], ...}
+# 失败: {"ok": false, "stage": "config|assembly", "reason": ..., "failure_chain": [...]}
+#       旧装配继续对外服务，修复配置后再发一次即可
+```
+
+可运行期生效：插件参数（options）、启用/禁用插件、启用已注册的新插件。
+仍需重启：增删/升级插件代码、改插件 scope、改配置来源结构。
+细节见 [`docs/architecture.md`](docs/architecture.md) 第 4 节。

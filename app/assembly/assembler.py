@@ -111,8 +111,17 @@ class Assembler:
         visit(failed.manifest.name, frozenset())
         return chain
 
-    async def assemble(self) -> tuple[Container, AssemblyReport]:
-        """执行完整装配，返回容器与报告；失败回滚并抛 AssemblyError。"""
+    async def assemble(
+        self, reuse: dict[str, object] | None = None
+    ) -> tuple[Container, AssemblyReport]:
+        """执行完整装配，返回容器与报告；失败回滚并抛 AssemblyError。
+
+        ``reuse``：插件名 -> 既有应用级实例（热更新时配置与实现均未变化的
+        插件）。被复用的插件跳过工厂与 on_start，直接登记到本次容器；
+        它们不进入 started 列表，装配失败回滚时**不会**被 on_stop，
+        所有权仍属于旧装配。
+        """
+        reuse = reuse or {}
         report = AssemblyReport(source_order=list(self._config.source_order))
         order = self._registry.resolve_order()
         specs = self._enabled_specs(order)
@@ -120,6 +129,8 @@ class Assembler:
         self._validate_enabled_dependencies(specs)
 
         logger.info("装配顺序: %s", [s.manifest.name for s in specs])
+        if reuse:
+            logger.info("复用既有实例: %s", sorted(reuse))
 
         container = Container()
         started: list[PluginSpec] = []
@@ -128,6 +139,13 @@ class Assembler:
             m = spec.manifest
             pc = self._config.plugins.get(m.name)
             options = pc.options if pc is not None else {}
+            if m.scope == "app" and m.name in reuse:
+                instance = reuse[m.name]
+                for interface in (None, *m.provides):
+                    container.register_instance(m.name, interface, instance)
+                report.record_step(AssemblyStep(m.name, m.provides, m.scope, "reused"))
+                logger.info("复用装配: %s (app)", m.name)
+                continue
             try:
                 if spec.validate_options is not None:
                     spec.validate_options(options)

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 from ..plugins.contract import PluginContext, PluginSpec
@@ -29,6 +30,11 @@ class Container:
         self._request_options: dict[str, dict[str, Any]] = {}
         self._disposed = False
         self._lock = asyncio.Lock()
+        # 热更新退役/排空：退役后不再派生新请求作用域，
+        # 在途作用域归零时触发回调（由监督器负责最终释放）。
+        self._active_scopes = 0
+        self._retired = False
+        self._drain_callbacks: list[Callable[[], None]] = []
 
     def register_instance(self, name: str, interface: str | None, instance: Any) -> None:
         """登记一个已装配完成的应用级实例。
@@ -92,7 +98,42 @@ class Container:
     def new_request_scope(self) -> RequestScope:
         if self._disposed:
             raise ContainerDisposedError("容器已释放，无法创建请求作用域")
+        if self._retired:
+            raise ContainerDisposedError("容器已退役（热更新切换中），无法创建请求作用域")
+        self._active_scopes += 1
         return RequestScope(self)
+
+    def retire(self, on_drained: Callable[[], None] | None = None) -> None:
+        """标记退役：不再接受新请求作用域；在途作用域归零后触发回调。
+
+        回调幂等（只触发一次）；若当前无在途作用域则立即触发。
+        """
+        if self._retired:
+            return
+        self._retired = True
+        if on_drained is not None:
+            self._drain_callbacks.append(on_drained)
+        if self._active_scopes == 0:
+            self._fire_drained()
+
+    def _scope_closed(self) -> None:
+        """请求作用域释放时回调；退役且归零则触发排空回调。"""
+        self._active_scopes -= 1
+        if self._retired and self._active_scopes == 0:
+            self._fire_drained()
+
+    def _fire_drained(self) -> None:
+        callbacks, self._drain_callbacks = self._drain_callbacks, []
+        for cb in callbacks:
+            cb()
+
+    @property
+    def retired(self) -> bool:
+        return self._retired
+
+    @property
+    def active_scopes(self) -> int:
+        return self._active_scopes
 
     async def dispose(self) -> None:
         """释放容器（幂等）。"""
@@ -157,15 +198,18 @@ class RequestScope:
         if self._disposed:
             return
         self._disposed = True
-        for canonical in reversed(self._creation_order):
-            instance = self._instances.get(canonical)
-            on_stop = getattr(instance, "on_request_stop", None)
-            if callable(on_stop):
-                result = on_stop()
-                if asyncio.iscoroutine(result):
-                    await result
-        self._instances.clear()
-        self._creation_order.clear()
+        try:
+            for canonical in reversed(self._creation_order):
+                instance = self._instances.get(canonical)
+                on_stop = getattr(instance, "on_request_stop", None)
+                if callable(on_stop):
+                    result = on_stop()
+                    if asyncio.iscoroutine(result):
+                        await result
+        finally:
+            self._instances.clear()
+            self._creation_order.clear()
+            self._container._scope_closed()
 
     @property
     def disposed(self) -> bool:

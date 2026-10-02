@@ -28,7 +28,7 @@ class AssemblyReport:
 
     def record_step(self, step: AssemblyStep) -> None:
         self.steps.append(step)
-        if step.status == "ok":
+        if step.status in ("ok", "reused"):
             if step.scope == "app":
                 self.assembled.append(step.plugin)
             else:

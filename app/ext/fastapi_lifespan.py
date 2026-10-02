@@ -1,7 +1,10 @@
-"""FastAPI 集成：lifespan 装配/释放、请求作用域与接口注入。
+"""FastAPI 集成：lifespan 装配/释放、请求作用域与接口注入、热更新切换。
 
-* ``build_lifespan``：启动时执行装配（失败则应用拒绝启动），关停时释放容器；
-* 请求中间件：每个请求派生独立 ``RequestScope``，请求结束逆序释放；
+* ``build_lifespan``：启动时由监督器完成首次装配（失败则应用拒绝启动），
+  关停时释放当前装配；
+* 请求中间件：每个请求**起点**从 app.state 取当前容器并派生独立
+  ``RequestScope``——热更新切换容器是原子替换，单个请求自始至终只持有
+  起点那一刻的装配，绝不出现新旧实例混用；旧容器等在途请求排空后释放；
 * ``requires(interface)``：路由依赖，自动从当前请求作用域取实例
   （应用级接口拿到全局单例，请求级接口拿到请求私有实例）。
 """
@@ -15,9 +18,8 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 
-from ..assembly.assembler import Assembler
-from ..assembly.report import AssemblyReport
 from ..di.container import Container, RequestScope
+from ..runtime.supervisor import PluginSupervisor
 
 logger = logging.getLogger("app.ext")
 
@@ -44,29 +46,32 @@ def requires(interface: str) -> Callable[[Request], Any]:
     return _resolver
 
 
-def build_lifespan(assembler: Assembler):
+def build_lifespan(supervisor: PluginSupervisor):
     """构造 FastAPI lifespan：启动装配、关停释放。"""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        container, report = await assembler.assemble()
-        attach_container(app, container, report)
+        report = await supervisor.start(
+            publish=lambda container, rep: attach_container(app, container, rep)
+        )
         logger.info("应用启动完成，装配报告:\n%s", report.describe())
         try:
             yield
         finally:
-            logger.info("应用关停，释放容器")
-            await container.dispose()
+            logger.info("应用关停，释放当前装配")
+            await supervisor.shutdown()
 
     return lifespan
 
 
-def install(app: FastAPI, assembler: Assembler) -> FastAPI:
+def install(app: FastAPI, supervisor: PluginSupervisor) -> FastAPI:
     """安装 lifespan 与请求作用域中间件。"""
-    app.router.lifespan_context = build_lifespan(assembler)
+    app.router.lifespan_context = build_lifespan(supervisor)
 
     @app.middleware("http")
     async def request_scope_middleware(request: Request, call_next):
+        # 请求起点一次性取当前容器：此后即使发生热更新切换，
+        # 本请求仍持有起点那套装配直到结束，不被打断、不混用。
         container = get_container(request.app)
         scope = container.new_request_scope()
         setattr(request.state, SCOPE_REQUEST_ATTR, scope)
@@ -78,8 +83,8 @@ def install(app: FastAPI, assembler: Assembler) -> FastAPI:
     return app
 
 
-def attach_container(app: FastAPI, container: Container, report: AssemblyReport) -> None:
-    """把容器与装配报告挂到 app.state。"""
+def attach_container(app: FastAPI, container: Container, report) -> None:
+    """把容器与装配报告挂到 app.state（热更新切换时整体替换）。"""
     setattr(app.state, CONTAINER_ATTR, container)
     setattr(app.state, REPORT_ATTR, report)
 
@@ -92,7 +97,7 @@ def get_container(app: FastAPI) -> Container:
     return container
 
 
-def get_report(app: FastAPI) -> AssemblyReport:
+def get_report(app: FastAPI):
     report = getattr(app.state, REPORT_ATTR, None)
     if report is None:
         raise RuntimeError("装配报告不存在（lifespan 是否执行？）")
