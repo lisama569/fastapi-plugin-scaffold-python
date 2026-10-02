@@ -27,11 +27,22 @@ logger = logging.getLogger("app.assembly")
 
 
 class Assembler:
-    """根据配置与注册表完成确定性装配。"""
+    """根据配置与注册表完成确定性装配。
 
-    def __init__(self, registry: PluginRegistry, config: AppConfig) -> None:
+    ``reuse`` 传入 插件名 -> 既有实例 的映射（热更新场景）：命中的应用级
+    插件直接登记既有实例，不再执行工厂与 on_start；这些实例的所有权属于
+    上一代装配，本次装配失败回滚时不会停止它们。
+    """
+
+    def __init__(
+        self,
+        registry: PluginRegistry,
+        config: AppConfig,
+        reuse: dict[str, object] | None = None,
+    ) -> None:
         self._registry = registry
         self._config = config
+        self._reuse = reuse or {}
 
     def _enabled_specs(self, order: list[PluginSpec]) -> list[PluginSpec]:
         """按拓扑序过滤禁用插件（显式 enabled=false 才禁用）。"""
@@ -126,6 +137,15 @@ class Assembler:
 
         for spec in specs:
             m = spec.manifest
+            if m.scope == "app" and m.name in self._reuse:
+                # 复用上一代实例：只登记，不重建、不重跑 on_start；
+                # 不加入 started，回滚/退役均不会停止它
+                instance = self._reuse[m.name]
+                for interface in (None, *m.provides):
+                    container.register_instance(m.name, interface, instance)
+                report.record_step(AssemblyStep(m.name, m.provides, m.scope, "reused"))
+                logger.info("复用上一代实例: %s", m.name)
+                continue
             pc = self._config.plugins.get(m.name)
             options = pc.options if pc is not None else {}
             try:

@@ -1,7 +1,10 @@
-"""FastAPI 集成：lifespan 装配/释放、请求作用域与接口注入。
+"""FastAPI 集成：lifespan 装配/释放、请求作用域与接口注入、运行期热更新。
 
-* ``build_lifespan``：启动时执行装配（失败则应用拒绝启动），关停时释放容器；
-* 请求中间件：每个请求派生独立 ``RequestScope``，请求结束逆序释放；
+* ``build_lifespan``：启动时执行首次装配（失败则应用拒绝启动），关停时
+  退役当前装配代并等待全部清理完成；
+* 请求中间件：在同步区间内读取当前装配代并登记在用引用（热更新切换
+  不会打断在途请求），每个请求派生独立 ``RequestScope``，请求结束
+  逆序释放并归还代的引用；
 * ``requires(interface)``：路由依赖，自动从当前请求作用域取实例
   （应用级接口拿到全局单例，请求级接口拿到请求私有实例）。
 """
@@ -15,14 +18,13 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 
-from ..assembly.assembler import Assembler
 from ..assembly.report import AssemblyReport
 from ..di.container import Container, RequestScope
+from ..runtime.reloader import Runtime
 
 logger = logging.getLogger("app.ext")
 
-CONTAINER_ATTR = "plugin_container"
-REPORT_ATTR = "assembly_report"
+RUNTIME_ATTR = "plugin_runtime"
 SCOPE_REQUEST_ATTR = "plugin_scope"
 
 
@@ -44,56 +46,65 @@ def requires(interface: str) -> Callable[[Request], Any]:
     return _resolver
 
 
-def build_lifespan(assembler: Assembler):
-    """构造 FastAPI lifespan：启动装配、关停释放。"""
+def build_lifespan(runtime: Runtime):
+    """构造 FastAPI lifespan：启动装配、关停退役。"""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        container, report = await assembler.assemble()
-        attach_container(app, container, report)
+        await runtime.start()
+        attach_runtime(app, runtime)
+        report = runtime.current().report
         logger.info("应用启动完成，装配报告:\n%s", report.describe())
         try:
             yield
         finally:
-            logger.info("应用关停，释放容器")
-            await container.dispose()
+            logger.info("应用关停，退役当前装配代")
+            await runtime.shutdown()
 
     return lifespan
 
 
-def install(app: FastAPI, assembler: Assembler) -> FastAPI:
+def install(app: FastAPI, runtime: Runtime) -> FastAPI:
     """安装 lifespan 与请求作用域中间件。"""
-    app.router.lifespan_context = build_lifespan(assembler)
+    app.router.lifespan_context = build_lifespan(runtime)
 
     @app.middleware("http")
     async def request_scope_middleware(request: Request, call_next):
-        container = get_container(request.app)
-        scope = container.new_request_scope()
-        setattr(request.state, SCOPE_REQUEST_ATTR, scope)
+        runtime = get_runtime(request.app)
+        # 读取当前代 + 登记引用在同一同步区间内完成：
+        # 重载协程无法插入其间，在途请求始终跑完整的一代
+        generation = runtime.current_and_acquire()
         try:
-            return await call_next(request)
+            scope = generation.container.new_request_scope()
+            setattr(request.state, SCOPE_REQUEST_ATTR, scope)
+            try:
+                return await call_next(request)
+            finally:
+                await scope.dispose()
         finally:
-            await scope.dispose()
+            generation.release()
 
     return app
 
 
-def attach_container(app: FastAPI, container: Container, report: AssemblyReport) -> None:
-    """把容器与装配报告挂到 app.state。"""
-    setattr(app.state, CONTAINER_ATTR, container)
-    setattr(app.state, REPORT_ATTR, report)
+def attach_runtime(app: FastAPI, runtime: Runtime) -> None:
+    """把运行时挂到 app.state。"""
+    setattr(app.state, RUNTIME_ATTR, runtime)
+
+
+def get_runtime(app: FastAPI) -> Runtime:
+    """从 app.state 取运行时。"""
+    runtime = getattr(app.state, RUNTIME_ATTR, None)
+    if runtime is None:
+        raise RuntimeError("运行时尚未就绪（lifespan 是否执行？）")
+    return runtime
 
 
 def get_container(app: FastAPI) -> Container:
-    """从 app.state 取容器。"""
-    container = getattr(app.state, CONTAINER_ATTR, None)
-    if container is None:
-        raise RuntimeError("容器尚未装配完成（lifespan 是否执行？）")
-    return container
+    """当前对外服务装配代的容器。"""
+    return get_runtime(app).current().container
 
 
 def get_report(app: FastAPI) -> AssemblyReport:
-    report = getattr(app.state, REPORT_ATTR, None)
-    if report is None:
-        raise RuntimeError("装配报告不存在（lifespan 是否执行？）")
-    return report
+    """当前对外服务装配代的装配报告。"""
+    return get_runtime(app).current().report

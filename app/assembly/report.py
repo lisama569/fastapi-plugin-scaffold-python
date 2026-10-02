@@ -10,7 +10,7 @@ class AssemblyStep:
     plugin: str
     interfaces: tuple[str, ...]
     scope: str
-    status: str  # "ok" | "failed" | "rolled-back"
+    status: str  # "ok" | "reused" | "failed" | "rolled-back"
     detail: str = ""
 
 
@@ -19,6 +19,7 @@ class AssemblyReport:
     source_order: list[str] = field(default_factory=list)
     steps: list[AssemblyStep] = field(default_factory=list)
     assembled: list[str] = field(default_factory=list)
+    reused: list[str] = field(default_factory=list)
     request_registered: list[str] = field(default_factory=list)
     rolled_back: list[str] = field(default_factory=list)
     failure_chain: list[str] = field(default_factory=list)
@@ -33,6 +34,8 @@ class AssemblyReport:
                 self.assembled.append(step.plugin)
             else:
                 self.request_registered.append(step.plugin)
+        elif step.status == "reused":
+            self.reused.append(step.plugin)
 
     def describe(self) -> str:
         """生成稳定、可断言的多行文本描述。"""
@@ -46,7 +49,10 @@ class AssemblyReport:
                 + (f" 详情={step.detail}" if step.detail else "")
             )
         if self.ok:
-            lines.append(f"装配成功: 应用级 {self.assembled} | 请求级 {self.request_registered}")
+            lines.append(
+                f"装配成功: 应用级 {self.assembled} | 复用 {self.reused} "
+                f"| 请求级 {self.request_registered}"
+            )
         else:
             lines.append(f"装配失败于: {self.failure_plugin}: {self.failure_reason}")
             lines.append(f"失败链路: {' -> '.join(self.failure_chain)}")
