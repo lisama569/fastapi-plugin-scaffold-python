@@ -5,10 +5,12 @@
 1. 过滤掉配置中 enabled=false 的插件；
 2. 注册表图校验（依赖存在/版本/环，已在注册阶段与 resolve_order 覆盖）；
 3. 校验作用域规则：请求级插件不能被应用级插件依赖；
-4. 每个插件 validate_options（拒绝非法配置，绝不静默套用默认）；
-5. 拓扑序实例化：注入依赖实例（app 级登记单例，request 级登记规格）；
-6. 按序执行 on_start；任一步失败：逆序执行已启动插件的 on_stop，
-   释放容器，并抛 AssemblyError（携带装配顺序、已完成列表、失败链路）。
+4. 拓扑序逐插件：先执行 validate_options（拒绝非法配置，绝不静默套用默认），
+   通过后再实例化；app 级登记单例，request 级登记规格；
+5. 按序执行 on_start；任一步失败（含 validate_options 主动拒绝）：
+   逆序执行本次已启动插件的 on_stop，释放容器，并抛 AssemblyError
+   （携带装配顺序、已完成列表、失败链路）。拒绝发生在实例化前，
+   因此回滚的是排在它之前、本次已经启动的依赖插件。
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import logging
 from ..config.model import AppConfig
 from ..di.container import Container
 from ..plugins.contract import PluginContext, PluginSpec
-from ..plugins.errors import AssemblyError, PluginConfigRejectedError
+from ..plugins.errors import AssemblyError
 from ..plugins.registry import PluginRegistry
 from .report import AssemblyReport, AssemblyStep
 
@@ -161,9 +163,10 @@ class Assembler:
                     started.append(spec)
             except AssemblyError:
                 raise
-            except PluginConfigRejectedError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 统一转 AssemblyError
+            except Exception as exc:  # noqa: BLE001 - 含插件主动拒绝，统一转 AssemblyError
+                # 插件 validate_options 主动拒绝（PluginConfigRejectedError）与工厂/
+                # 启动失败走同一条失败路径：记录失败点、逆序回滚本次尝试已启动的
+                # 插件、释放本次容器，绝不留下已初始化未回收的实例。
                 report.record_step(AssemblyStep(m.name, m.provides, m.scope, "failed", str(exc)))
                 chain = self._failure_chain(spec)
                 await self._rollback(container, started, report)

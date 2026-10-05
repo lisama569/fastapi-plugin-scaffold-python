@@ -62,7 +62,10 @@ plugins:
 * `factory(ctx) -> instance`：同步或异步工厂，`ctx.dependencies` 已按接口名注入依赖，
   `ctx.options` 为该插件的配置。
 * `on_start` / `on_stop`：应用级生命周期钩子（异步）。
-* `validate_options(options)`：启动前配置自检，抛异常即拒绝装配。
+* `validate_options(options)`：**实例化之前**的配置自检。插件据此主动拒绝非法配置：
+  推荐抛 `PluginConfigRejectedError(plugin, reason)`（也允许抛任意异常，原因取
+  `str(exc)`）。启动期自检失败 → 应用拒绝启动；运行期热更新时自检失败 →
+  本次更新在 `assembly` 阶段整体回退（见第 4 节），旧装配继续服务。
 
 ### 兼容规则（全部在启动阶段判定，不满足即拒绝）
 
@@ -94,8 +97,10 @@ plugins:
 | `request` | 首次被该请求取用时   | 单次 HTTP 请求       | 每请求独立实例，结束即释放   |
 
 * 装配按**拓扑序**进行（被依赖者先装配）；实例化后执行 `on_start`。
-* **中途失败回滚**：任一插件工厂或 `on_start` 失败，对已完成 `on_start` 的插件
-  **逆序执行 `on_stop`**，随后释放容器，并抛出 `AssemblyError`。
+* **中途失败回滚**：任一插件 `validate_options` 自检拒绝、工厂或 `on_start` 失败，
+  对已完成 `on_start` 的插件**逆序执行 `on_stop`**，随后释放容器，并抛出
+  `AssemblyError`。自检拒绝发生在该插件实例化之前，因此被回滚的是本次装配中
+  排在它前面（依赖链下层）、已经启动的插件。
   错误对象携带：失败插件、原因、失败链路（最深根因 → 失败点）、已完成列表、已回滚列表。
 * 应用级实例登记进 `Container`；请求级插件登记“创建规格”，在每个 `RequestScope`
   中惰性创建。请求级插件依赖应用级接口时，拿到的是同一个全局单例。
@@ -124,13 +129,21 @@ plugins:
 
 * **单请求不混用**：请求中间件在请求**起点**一次性取当前容器，该请求自始至终
   持有起点那套装配；更新期间在途请求用旧实例正常跑完，不被打断。
-* **失败整体回退**：新配置不合法、依赖不满足或装配中途任何插件报错，
-  本次更新整体放弃——新装配中已启动的插件逆序回滚，复用实例所有权仍归旧装配
-  （不会被回滚波及），旧装配继续对外服务。调用方收到 `ReloadError`，
-  携带失败阶段（`config` / `assembly`）、原因与可定位的失败链路；
-  `POST /reload` 返回 `{"ok": false, "stage", "reason", "failure_chain"}`。
+* **失败整体回退**：新配置不合法、依赖不满足、装配中途任何插件报错，或**插件在
+  `validate_options` 自检中主动拒绝配置**，本次更新都整体放弃——本次尝试中已
+  `on_start` 的新实例（含因配置变化而重建的依赖）按依赖逆序执行 `on_stop`，
+  新容器释放；复用实例所有权仍归旧装配（不会被回滚波及），旧装配继续对外服务，
+  同进程其它请求不受影响。调用方收到 `ReloadError`，携带失败阶段
+  （`config` / `assembly`）、原因与可定位的失败链路（依赖链任意一层失败都能指出
+  是哪个插件、经由怎样一条链传导到失败点）；`POST /reload` 返回
+  `{"ok": false, "stage", "reason", "failure_chain"}`（HTTP 200，失败语义在响应体中，
+  不会甩 500）。把配置改回合法后再次触发即可成功切换，可反复失败-修复-成功。
+* **触发面与配置来源无关**：无论变更是来自配置文件、环境变量还是 `overrides`
+  显式覆盖，热更新都走同一条装配与回退路径；返回的 `reason` 取自拒绝插件自身，
+  `failure_chain` 与具体来源无关。日志同时打印逐键生效来源，可交叉定位。
 * **并发触发确定可解释**：所有热更新在一把锁上串行执行，每次都在拿到锁后
   重新加载最新配置——最终结果确定（以最后一次完成的更新为准），互不踩踏；
+  并发失败时每次失败尝试各自回滚各自新建的实例，旧实例不被重复停止、不泄漏；
   配置已无变化的后续更新会整体复用，不做无用功。
 * **应用级单例不重复初始化**：配置与实现都未变的应用级插件在成功更新后
   仍是同一个实例（如 `clock` 的 tick 计数在更新前后连续累加）。
@@ -168,15 +181,15 @@ plugins:
 | `PluginNotFoundError`         | 图校验期   | 依赖接口无提供者                       |
 | `VersionIncompatibleError`    | 图校验期   | 版本区间不满足                         |
 | `CircularDependencyError`     | 拓扑排序期 | 依赖成环（携带具体环）                 |
-| `PluginConfigRejectedError`   | 装配期     | 插件 `validate_options` 拒绝配置       |
-| `AssemblyError`               | 装配期     | 工厂/钩子失败，携带失败链路与回滚列表  |
+| `PluginConfigRejectedError`   | 装配期     | 插件 `validate_options` 主动拒绝配置；启动期拒绝启动，热更新期触发整体回退 |
+| `AssemblyError`               | 装配期     | 自检拒绝/工厂/钩子失败，携带失败链路与回滚列表  |
 
 ### 运行期热更新（`app/runtime/errors.py`）
 
 | 异常           | 触发阶段            | 场景                                             |
 | -------------- | ------------------- | ------------------------------------------------ |
 | `ReloadError`  | 热更新 config 阶段  | 新配置加载/校验失败（包装底层配置错误）          |
-| `ReloadError`  | 热更新 assembly 阶段| 新装配失败（包装 AssemblyError，携带失败链路）   |
+| `ReloadError`  | 热更新 assembly 阶段| 新装配失败（包装 `AssemblyError`，含插件主动拒绝配置、工厂/钩子失败，携带失败链路） |
 
 `ReloadError` 抛出时旧装配保持对外服务，应用不进入中间态；修复配置后可再次触发更新。
 
@@ -192,9 +205,12 @@ plugins:
 # 安装依赖（含 dev 测试依赖）
 uv sync --group dev
 
-# 运行全部单测（58 个），日志会打印配置来源、装配顺序、失败链路
+# 运行全部单测（62 个），日志会打印配置来源、装配顺序、失败链路
 uv run pytest -q
 uv run pytest -q -o log_cli=true -o log_cli_level=DEBUG   # 实时查看装配日志
+
+# 只看“插件拒绝配置导致热更新失败并回滚”的用例（日志含来源/顺序/链路）
+uv run pytest tests/test_hotreload.py -k "reject" -o log_cli=true -o log_cli_level=INFO
 
 # 代码检查与格式化
 uvx ruff check app tests main.py
@@ -210,8 +226,16 @@ curl -s http://127.0.0.1:8000/assembly-report
 curl -s -X POST http://127.0.0.1:8000/reload
 # -> {"ok": true, "reused": ["clock"], "rebuilt": [], ...}
 curl -s http://127.0.0.1:8000/             # 新配置已生效，无需重启
-# 若改出非法配置（如 greeting 置空），/reload 返回 ok:false 与失败链路，
-# 旧装配继续服务；改回合法配置再次 /reload 即可恢复。
+
+# 验证“插件自检拒绝 -> 失败回退”闭环：
+# 1) 把 greeter 的 greeting 改成空白（greeter.validate_options 会拒绝），
+#    POST /reload 返回可解释失败（注意不是 500）：
+#    {"ok": false, "stage": "assembly",
+#     "reason": "...greeting 必须是非空字符串...",
+#     "failure_chain": ["clock", "greeter"]}
+# 2) 紧接着 GET / 仍返回旧 greeting —— 旧装配继续服务；
+# 3) 把 greeting 改回非空，再次 POST /reload -> {"ok": true}，GET / 即新值。
+# 失败当次新建/启动过的应用级插件会按依赖逆序 on_stop（见日志“已回滚: [...]”）。
 ```
 
 测试覆盖（`tests/`）：
@@ -223,5 +247,6 @@ curl -s http://127.0.0.1:8000/             # 新配置已生效，无需重启
 * `test_scopes.py`：并发请求共享单例、请求级隔离与不泄漏、释放保护、幂等释放；
 * `test_api.py`：HTTP 端到端注入、20 并发单例共享、env 覆盖、各类启动期失败；
 * `test_hotreload.py`：热更新成功切换与未变复用、依赖级联重建、失败整体回退
-  （配置/装配两阶段）、并发触发串行化与确定性、在途请求不被打断、
-  HTTP 端到端热更新。
+  （配置/装配两阶段）、**插件 `validate_options` 主动拒绝后的失败解释、逆序回滚、
+  旧装配可用与改回合法后再次成功（含 overrides 来源的 HTTP 端到端用例）**、
+  并发触发串行化与确定性（含并发失败互不踩踏）、在途请求不被打断。

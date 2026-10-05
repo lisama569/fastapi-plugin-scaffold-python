@@ -74,6 +74,19 @@ curl -s -X POST http://127.0.0.1:8000/reload
 #       旧装配继续对外服务，修复配置后再发一次即可
 ```
 
+### 插件自检拒绝配置时的行为
+
+插件可在 `validate_options` 中对自己的配置做加载前自检，非法时抛
+`PluginConfigRejectedError`（或任意异常）主动拒绝。运行期热更新撞上这种拒绝时：
+
+* `POST /reload` 返回 **HTTP 200 + `{"ok": false, "stage": "assembly",
+  "reason": <插件给出的原因>, "failure_chain": [根因插件, ..., 拒绝插件]}`**，
+  而不是没有解释的 500；配置文件、env、`overrides` 任一来源触发都一样；
+* 本次尝试整体回退：已经启动过的新实例按依赖逆序 `on_stop`、新容器释放，
+  复用的旧实例与旧装配不受影响，继续对外服务，同进程其它请求无感；
+* 把配置改回合法后再次 `POST /reload` 即可成功切换（可反复失败-修复-成功）；
+* 并发/连续触发由单锁串行化，每次失败各自回滚各自的尝试，结果确定、不互相踩踏。
+
 可运行期生效：插件参数（options）、启用/禁用插件、启用已注册的新插件。
 仍需重启：增删/升级插件代码、改插件 scope、改配置来源结构。
-细节见 [`docs/architecture.md`](docs/architecture.md) 第 4 节。
+失败回滚的本地验证步骤见 [`docs/architecture.md`](docs/architecture.md) 第 4、6 节。

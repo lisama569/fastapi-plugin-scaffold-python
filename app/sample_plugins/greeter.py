@@ -8,6 +8,7 @@ from ..plugins.contract import (
     PluginManifest,
     PluginSpec,
 )
+from ..plugins.errors import PluginConfigRejectedError
 from .clock import ClockService
 
 
@@ -25,7 +26,8 @@ class GreeterService:
 def _validate_options(options: dict) -> None:
     greeting = options.get("greeting", "hello")
     if not isinstance(greeting, str) or not greeting.strip():
-        raise ValueError("greeting 必须是非空字符串")
+        # 主动拒绝：启动期让应用拒绝启动；热更新期令本次更新失败并整体回退
+        raise PluginConfigRejectedError("greeter", "greeting 必须是非空字符串")
 
 
 def _factory(ctx: PluginContext) -> GreeterService:
