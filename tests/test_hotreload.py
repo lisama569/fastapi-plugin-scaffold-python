@@ -159,6 +159,95 @@ async def test_reload_failure_keeps_old_assembly_serving(caplog) -> None:
     assert outcome.ok
 
 
+async def test_reload_config_rejected_by_plugin_rolls_back_and_keeps_old(caplog) -> None:
+    """插件主动拒绝配置（PluginConfigRejectedError）：
+
+    与其它装配失败同等对待——抛 ReloadError（阶段/原因/失败链路齐全），
+    本次尝试中已启动的插件按依赖逆序回滚释放，复用实例所有权仍归旧装配，
+    旧装配继续对外服务；改回合法配置后再次热更新成功。
+    """
+    from app.plugins.errors import PluginConfigRejectedError
+
+    track: list[str] = []
+    clock = make_spec("clock", track=track)
+    cache = make_spec("cache", requires=(InterfaceRequirement("clock", "^1.0.0"),), track=track)
+
+    def reject_bad(options: dict) -> None:
+        if options.get("mode") == "bad":
+            raise PluginConfigRejectedError("top", "mode 不允许为 'bad'")
+
+    top = make_spec(
+        "top",
+        requires=(InterfaceRequirement("cache", "^1.0.0"),),
+        track=track,
+        validate=reject_bad,
+    )
+    configs = [
+        make_config(
+            {"clock": (True, "app"), "cache": (True, "app"), "top": (True, "app")},
+            options={"cache": {"size": 1}, "top": {"mode": "good"}},
+        ),
+        # cache 配置变化（会重建并启动），top 配置非法（装配深层主动拒绝）
+        make_config(
+            {"clock": (True, "app"), "cache": (True, "app"), "top": (True, "app")},
+            options={"cache": {"size": 2}, "top": {"mode": "bad"}},
+        ),
+        make_config(
+            {"clock": (True, "app"), "cache": (True, "app"), "top": (True, "app")},
+            options={"cache": {"size": 3}, "top": {"mode": "good"}},
+        ),
+    ]
+    sup, cursor = _supervisor([clock, cache, top], configs)
+    await sup.start()
+    old_container = sup.current_container()
+    old_clock = old_container.get("clock")
+    old_cache = old_container.get("cache")
+    assert track == [
+        "create:clock",
+        "start:clock",
+        "create:cache",
+        "start:cache",
+        "create:top",
+        "start:top",
+    ]
+
+    cursor["i"] = 1
+    with pytest.raises(ReloadError) as exc:
+        await sup.reload()
+
+    # 可解释结果：阶段、原因、失败链路（根因 -> 失败点）齐全
+    assert exc.value.stage == "assembly"
+    assert "拒绝配置" in exc.value.reason
+    assert "mode 不允许为 'bad'" in exc.value.reason
+    assert exc.value.chain == ["clock", "cache", "top"]
+
+    # 本次尝试里已启动的 cache 被逆序回滚释放；复用的 clock 不被波及
+    assert track.count("create:cache") == 2  # 首次装配 + 失败尝试各一次
+    assert "stop:cache" in track
+    assert "stop:clock" not in track
+    assert "create:top" in track and track.count("create:top") == 1  # 校验在实例化前
+
+    # 旧装配原样对外服务：容器未换、实例未动、未退役未释放
+    assert sup.current_container() is old_container
+    assert sup.current_container().get("clock") is old_clock
+    assert sup.current_container().get("cache") is old_cache
+    assert not old_container.retired
+    assert not old_container.disposed
+
+    # 日志能看到失败链路与回滚记录
+    log_text = "\n".join(r.message for r in caplog.records)
+    assert "失败链路" in log_text
+    assert "已回滚插件" in log_text
+
+    # 改回合法配置后再次热更新成功（应用没有进入半新半旧状态）
+    cursor["i"] = 2
+    outcome = await sup.reload()
+    assert outcome.ok
+    assert outcome.reused == ["clock"]
+    assert sorted(outcome.rebuilt) == ["cache", "top"]
+    assert sup.current_container().get("clock") is old_clock  # clock 始终未重建
+
+
 async def test_reload_with_invalid_config_fails_at_config_stage() -> None:
     """新配置不合法：在配置阶段即失败，不进入装配，旧装配不受影响。"""
     clock = make_spec("clock")
@@ -346,3 +435,182 @@ def test_http_reload_failure_keeps_old_assembly(tmp_path, caplog) -> None:
 
     log_text = "\n".join(r.message for r in caplog.records)
     assert "热更新" in log_text
+
+
+# -- HTTP 级：插件主动拒绝配置的失败回退 --------------------------------------
+
+
+def _rejecting_specs(track: list[str]) -> list:
+    """base(app) -> picker(app)：picker 在依赖链深层主动拒绝非法 token。"""
+    from app.plugins.errors import PluginConfigRejectedError
+
+    base = make_spec("base", track=track)
+
+    def validate(options: dict) -> None:
+        if options.get("token") == "bad":
+            raise PluginConfigRejectedError("picker", "token 不允许为 'bad'")
+
+    picker = make_spec(
+        "picker",
+        requires=(InterfaceRequirement("base", "^1.0.0"),),
+        track=track,
+        validate=validate,
+    )
+    return [base, picker]
+
+
+def _write_picker_config(path, token: str) -> None:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "base": {"enabled": True, "scope": "app", "options": {}},
+                    "picker": {
+                        "enabled": True,
+                        "scope": "app",
+                        "options": {"token": token},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _picker_app(track: list[str], config_path=None, overrides=None) -> Any:
+    app = create_app(
+        config_path=str(config_path) if config_path is not None else None,
+        defaults={"app_name": "t", "log_level": "info", "plugins": {}},
+        plugin_specs=_rejecting_specs(track),
+        environ={},
+        overrides=overrides,
+    )
+
+    @app.get("/token")
+    async def token(picker: Any = Depends(requires("picker"))):
+        return {"token": picker["options"].get("token")}
+
+    return app
+
+
+def test_http_reload_rejected_config_returns_explainable_failure(tmp_path, caplog) -> None:
+    """改配置文件触发：插件拒绝配置 -> /reload 返回 200 + 可解释失败体（不再是 500）。"""
+    track: list[str] = []
+    cfg = tmp_path / "app.yaml"
+    _write_picker_config(cfg, "good")
+    app = _picker_app(track, config_path=cfg)
+    with TestClient(app) as client:
+        assert client.get("/token").json() == {"token": "good"}
+
+        _write_picker_config(cfg, "bad")  # picker.validate_options 主动拒绝
+        resp = client.post("/reload")
+        assert resp.status_code == 200  # 不是 500
+        body = resp.json()
+        assert body["ok"] is False
+        assert body["stage"] == "assembly"
+        assert "拒绝配置" in body["reason"]
+        assert body["failure_chain"] == ["base", "picker"]  # 定位到失败点的链路
+
+        # 旧装配继续对外服务，同进程其它请求不受影响
+        assert client.get("/token").json() == {"token": "good"}
+        assert client.get("/healthz").json() == {"status": "ok"}
+
+        # 改回合法配置后再次热更新成功
+        _write_picker_config(cfg, "fixed")
+        assert client.post("/reload").json()["ok"] is True
+        assert client.get("/token").json() == {"token": "fixed"}
+
+    # 失败尝试中 base 配置未变被复用（既不重建也不被停）；
+    # picker 在校验阶段即被拒绝，失败尝试未产生任何新实例
+    assert "stop:base" not in track
+    assert track.count("create:picker") == 2  # 首次装配 + 修复后重建
+
+    log_text = "\n".join(r.message for r in caplog.records)
+    assert "配置加载来源" in log_text or "来源(低->高)" in log_text
+    assert "装配顺序" in log_text
+    assert "失败链路" in log_text
+
+
+def test_http_reload_rejected_via_overrides_source(caplog) -> None:
+    """覆盖项来源触发：失败返回同样可解释，日志能看到生效来源含 overrides。"""
+    track: list[str] = []
+    overrides: dict[str, Any] = {}
+    app = _picker_app(track, overrides=overrides)
+    with TestClient(app) as client:
+        assert client.get("/token").json() == {"token": None}
+
+        # 通过 overrides（最高优先级来源）把 token 改成非法值
+        overrides["plugins"] = {
+            "picker": {"enabled": True, "scope": "app", "options": {"token": "bad"}}
+        }
+        resp = client.post("/reload")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is False
+        assert body["stage"] == "assembly"
+        assert body["failure_chain"] == ["base", "picker"]
+        assert client.get("/token").json() == {"token": None}  # 旧装配照常
+
+        overrides["plugins"]["picker"]["options"]["token"] = "from-overrides"
+        assert client.post("/reload").json()["ok"] is True
+        assert client.get("/token").json() == {"token": "from-overrides"}
+
+    log_text = "\n".join(r.message for r in caplog.records)
+    assert "overrides" in log_text  # 配置来源可解释
+
+
+# -- 监督器级：连续/并发触发失败更新结果确定 ------------------------------------
+
+
+async def test_concurrent_rejected_reloads_fail_deterministically() -> None:
+    """并发触发多次注定失败的热更新：全部以相同 ReloadError 失败、串行不踩踏，
+    每次尝试中已启动的插件都被回滚释放，旧装配始终对外服务。"""
+    from app.plugins.errors import PluginConfigRejectedError
+
+    track: list[str] = []
+    clock = make_spec("clock", track=track)
+    mid = make_spec("mid", requires=(InterfaceRequirement("clock", "^1.0.0"),), track=track)
+
+    def reject(options: dict) -> None:
+        if options.get("mode") == "bad":
+            raise PluginConfigRejectedError("top", "mode 非法")
+
+    top = make_spec(
+        "top",
+        requires=(InterfaceRequirement("mid", "^1.0.0"),),
+        track=track,
+        validate=reject,
+    )
+    good = make_config(
+        {"clock": (True, "app"), "mid": (True, "app"), "top": (True, "app")},
+        options={"top": {"mode": "good"}},
+    )
+    bad = make_config(
+        {"clock": (True, "app"), "mid": (True, "app"), "top": (True, "app")},
+        options={"mid": {"v": 2}, "top": {"mode": "bad"}},  # mid 重建启动后 top 拒绝
+    )
+    sup, cursor = _supervisor([clock, mid, top], [good, bad])
+    await sup.start()
+    old_container = sup.current_container()
+    started_mid_before = track.count("start:mid")
+
+    cursor["i"] = 1
+    results = await asyncio.gather(*(sup.reload() for _ in range(3)), return_exceptions=True)
+
+    # 结果确定：全部以相同的 ReloadError 失败（阶段/链路一致），无人成功
+    assert len(results) == 3
+    assert all(isinstance(r, ReloadError) for r in results)
+    assert all(r.stage == "assembly" for r in results)
+    assert all(r.chain == ["clock", "mid", "top"] for r in results)
+
+    # 串行执行互不踩踏：每次尝试里 mid 被创建并启动一次、回滚停止一次，
+    # 没有任何已初始化实例被遗留；复用的 clock 从未被停
+    attempts = track.count("start:mid") - started_mid_before
+    assert attempts == 3
+    assert track.count("stop:mid") == attempts
+    assert "stop:clock" not in track
+
+    # 旧装配始终对外服务
+    assert sup.current_container() is old_container
+    assert not old_container.retired
+    assert not old_container.disposed

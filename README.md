@@ -74,6 +74,11 @@ curl -s -X POST http://127.0.0.1:8000/reload
 #       旧装配继续对外服务，修复配置后再发一次即可
 ```
 
+插件在 `validate_options` 里判定配置非法时可抛 `PluginConfigRejectedError`
+主动拒绝本次更新：与装配失败同等处理——本次尝试已启动的插件逆序回滚释放，
+`/reload` 返回 HTTP 200 + `ok:false`（含失败阶段/原因/依赖链路，不会 500），
+旧装配照常服务；改回合法配置再次 `/reload` 即可切换。
+
 可运行期生效：插件参数（options）、启用/禁用插件、启用已注册的新插件。
 仍需重启：增删/升级插件代码、改插件 scope、改配置来源结构。
 细节见 [`docs/architecture.md`](docs/architecture.md) 第 4 节。

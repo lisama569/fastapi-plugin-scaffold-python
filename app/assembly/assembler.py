@@ -161,20 +161,25 @@ class Assembler:
                     started.append(spec)
             except AssemblyError:
                 raise
-            except PluginConfigRejectedError:
-                raise
             except Exception as exc:  # noqa: BLE001 - 统一转 AssemblyError
-                report.record_step(AssemblyStep(m.name, m.provides, m.scope, "failed", str(exc)))
+                # 插件主动拒绝配置（PluginConfigRejectedError）与其它装配失败同等对待：
+                # 记录失败步骤、逆序回滚已启动插件、释放新容器，再抛 AssemblyError，
+                # 由监督器包装为 ReloadError，保证调用方拿到可解释结果而非 500。
+                if isinstance(exc, PluginConfigRejectedError):
+                    reason = f"插件主动拒绝配置: {exc.reason}"
+                else:
+                    reason = str(exc)
+                report.record_step(AssemblyStep(m.name, m.provides, m.scope, "failed", reason))
                 chain = self._failure_chain(spec)
                 await self._rollback(container, started, report)
                 report.ok = False
                 report.failure_plugin = m.name
-                report.failure_reason = str(exc)
+                report.failure_reason = reason
                 report.failure_chain = chain
-                logger.error("装配失败于 %s: %s\n%s", m.name, exc, report.describe())
+                logger.error("装配失败于 %s: %s\n%s", m.name, reason, report.describe())
                 raise AssemblyError(
                     plugin=m.name,
-                    reason=str(exc),
+                    reason=reason,
                     chain=chain,
                     assembled=[s.manifest.name for s in started],
                     rolled_back=list(report.rolled_back),

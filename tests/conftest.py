@@ -39,6 +39,7 @@ def make_spec(
     start_fail: bool = False,
     track: list[str] | None = None,
     instance_factory: Any = None,
+    validate: Any = None,
 ) -> PluginSpec:
     """构造一个可追踪生命周期的测试插件规格。"""
 
@@ -74,6 +75,7 @@ def make_spec(
         factory=factory,
         on_start=on_start,
         on_stop=on_stop,
+        validate_options=validate,
     )
 
 

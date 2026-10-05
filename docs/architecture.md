@@ -129,6 +129,26 @@ plugins:
   （不会被回滚波及），旧装配继续对外服务。调用方收到 `ReloadError`，
   携带失败阶段（`config` / `assembly`）、原因与可定位的失败链路；
   `POST /reload` 返回 `{"ok": false, "stage", "reason", "failure_chain"}`。
+
+### 插件主动拒绝配置（`PluginConfigRejectedError`）
+
+插件在 `validate_options` 中判定配置非法时，抛
+`PluginConfigRejectedError(plugin, reason)` **主动拒绝**本次更新。
+这类拒绝与工厂/`on_start` 抛错**完全同等对待**：
+
+* 装配器记录失败步骤、计算失败链路（最深根因 → 失败点），对本次尝试中
+  已 `on_start` 的插件**逆序执行 `on_stop`** 并释放新容器——不会留下
+  已初始化却未回收的实例，也不会出现半新半旧的状态；
+* 被复用的旧实例所有权仍归旧装配，回滚不会波及它们；
+* 监督器将其包装为 `ReloadError(stage="assembly")`，`POST /reload`
+  返回 **HTTP 200** + `{"ok": false, "stage": "assembly", "reason",
+  "failure_chain": [...]}`（`reason` 含“插件主动拒绝配置”与插件给出的原因），
+  而不是 500；旧装配继续对外服务，同进程其它请求不受影响；
+* 把配置改回合法后再次 `POST /reload` 即可成功切换，应用不进入中间态。
+
+无论失败由哪个配置来源触发（配置文件 / 环境变量 / overrides），也无论
+失败点位于依赖链的哪一层，返回的 `failure_chain` 都能定位到失败插件及其
+依赖传导路径；并发或连续触发时所有更新在锁上串行执行，结果确定、可解释。
 * **并发触发确定可解释**：所有热更新在一把锁上串行执行，每次都在拿到锁后
   重新加载最新配置——最终结果确定（以最后一次完成的更新为准），互不踩踏；
   配置已无变化的后续更新会整体复用，不做无用功。
@@ -168,7 +188,7 @@ plugins:
 | `PluginNotFoundError`         | 图校验期   | 依赖接口无提供者                       |
 | `VersionIncompatibleError`    | 图校验期   | 版本区间不满足                         |
 | `CircularDependencyError`     | 拓扑排序期 | 依赖成环（携带具体环）                 |
-| `PluginConfigRejectedError`   | 装配期     | 插件 `validate_options` 拒绝配置       |
+| `PluginConfigRejectedError`   | 装配期     | 插件 `validate_options` 主动拒绝配置；装配器统一包装为 `AssemblyError`（热更新时再包装为 `ReloadError`），携带失败链路与回滚列表 |
 | `AssemblyError`               | 装配期     | 工厂/钩子失败，携带失败链路与回滚列表  |
 
 ### 运行期热更新（`app/runtime/errors.py`）
@@ -192,7 +212,7 @@ plugins:
 # 安装依赖（含 dev 测试依赖）
 uv sync --group dev
 
-# 运行全部单测（58 个），日志会打印配置来源、装配顺序、失败链路
+# 运行全部单测（62 个），日志会打印配置来源、装配顺序、失败链路
 uv run pytest -q
 uv run pytest -q -o log_cli=true -o log_cli_level=DEBUG   # 实时查看装配日志
 
@@ -210,8 +230,17 @@ curl -s http://127.0.0.1:8000/assembly-report
 curl -s -X POST http://127.0.0.1:8000/reload
 # -> {"ok": true, "reused": ["clock"], "rebuilt": [], ...}
 curl -s http://127.0.0.1:8000/             # 新配置已生效，无需重启
-# 若改出非法配置（如 greeting 置空），/reload 返回 ok:false 与失败链路，
-# 旧装配继续服务；改回合法配置再次 /reload 即可恢复。
+
+# 验证失败回退：把 greeting 改成空白字符串（greeter.validate_options 会
+# 主动拒绝），再触发更新：
+curl -s -X POST http://127.0.0.1:8000/reload
+# -> HTTP 200 {"ok": false, "stage": "assembly",
+#              "reason": "插件主动拒绝配置: greeting 必须是非空字符串",
+#              "failure_chain": ["clock", "greeter"]}   （不是 500）
+curl -s http://127.0.0.1:8000/             # 旧装配照常服务
+# 本次尝试中已启动的插件已被逆序回滚（日志可见“已回滚插件”）；
+# 把 greeting 改回合法值后再 POST /reload 即可成功切换。
+# 服务日志（或 pytest -o log_cli=true）能看到配置来源、装配顺序与失败链路。
 ```
 
 测试覆盖（`tests/`）：
@@ -223,5 +252,6 @@ curl -s http://127.0.0.1:8000/             # 新配置已生效，无需重启
 * `test_scopes.py`：并发请求共享单例、请求级隔离与不泄漏、释放保护、幂等释放；
 * `test_api.py`：HTTP 端到端注入、20 并发单例共享、env 覆盖、各类启动期失败；
 * `test_hotreload.py`：热更新成功切换与未变复用、依赖级联重建、失败整体回退
-  （配置/装配两阶段）、并发触发串行化与确定性、在途请求不被打断、
-  HTTP 端到端热更新。
+  （配置/装配两阶段，含插件主动拒绝配置时的回滚与旧装配保活）、
+  并发/连续触发串行化与确定性、在途请求不被打断、HTTP 端到端热更新
+  （配置文件与 overrides 两种来源触发）。
